@@ -1,0 +1,4 @@
+# Ignorar datasets y resultados de entrenamiento
+dataset_3clases/
+runs_mnv4/
+dataset_validacion_manual
