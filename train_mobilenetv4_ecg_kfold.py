@@ -3,19 +3,18 @@
 """
 K-Fold Cross-Validation con MobileNet-V4 para clasificación de ECG (3 clases: NORMAL, ANORMAL, MI)
 - PyTorch + timm
-- Focal Loss + class_weight por fold
-- AMP (mixed precision), ReduceLROnPlateau, EarlyStopping
+- CrossEntropy + class_weight por fold (label smoothing). (FocalLoss disponible si preferís.)
+- AMP (mixed precision), ReduceLROnPlateau (sin verbose), EarlyStopping
 - Split fijo de TEST y k-fold en TRAIN+VAL
 - Guarda por fold: mejor modelo, reporte y matriz de confusión (VAL y TEST)
 - Al final: resumen (media y desvío) y opción de entrenar modelo final en TRAIN+VAL y evaluar en TEST
 
-Requisitos:
-    pip install torch torchvision timm scikit-learn opencv-python matplotlib
-Uso ejemplo (Windows):
-    python train_mobilenetv4_ecg_kfold.py ^
-      --data_dir "C:/Users/belen/OneDrive/Escritorio/MOBILENET-V4/dataset_3clases" ^
-      --out_dir  "C:/Users/belen/OneDrive/Escritorio/MOBILENET-V4/runs_kfold" ^
-      --k_folds 5 --epochs 20 --batch_size 32 --lr 1e-4 --image_size 224
+Uso ejemplo (Colab):
+    !python train_mobilenetv4_ecg_kfold.py \
+      --data_dir "/content/ECG-MOBILENET-v4/dataset_3clases" \
+      --out_dir  "/content/drive/MyDrive/runs_kfold" \
+      --k_folds 5 --epochs 20 --batch_size 32 --lr 1e-4 --image_size 224 \
+      --model_name "mobilenetv4_hybrid_medium" --final_fit
 """
 import os
 import math
@@ -55,11 +54,11 @@ class TrainConfig:
     k_folds: int = 5
     test_split: float = 0.15
     seed: int = 42
-    num_workers: int = 4
-    patience: int = 8  # early stopping
+    num_workers: int = 2   # Colab-friendly
+    patience: int = 8      # early stopping
     focal_gamma: float = 2.0
     freeze_backbone_epochs: int = 3  # calentar la cabeza antes de FT total
-    final_fit: bool = True  # Entrenar modelo final en TRAIN+VAL y evaluar en TEST
+    final_fit: bool = False  # se habilita con --final_fit
 
 
 def set_seed(seed: int = 42):
@@ -76,7 +75,7 @@ def ensure_dir(path: str):
 
 
 # -----------------------------
-# Focal Loss con class_weight
+# Focal Loss con class_weight (opcional)
 # -----------------------------
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
@@ -97,13 +96,14 @@ class FocalLoss(nn.Module):
 
 
 # -----------------------------
-# Transforms
+# Transforms (con Grayscale a 3 canales)
 # -----------------------------
 def build_transforms(img_size):
     train_tfms = transforms.Compose([
         transforms.Resize(int(img_size * 1.15)),
         transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0), ratio=(0.95, 1.05)),
         transforms.RandomAffine(degrees=2, translate=(0.02, 0.02), shear=1),
+        transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
@@ -111,6 +111,7 @@ def build_transforms(img_size):
     val_tfms = transforms.Compose([
         transforms.Resize(int(img_size * 1.10)),
         transforms.CenterCrop(img_size),
+        transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
@@ -141,15 +142,15 @@ class EarlyStopping:
 
 
 # -----------------------------
-# Loop de entrenamiento/validación
+# Loop de entrenamiento/validación (con AMP seguro)
 # -----------------------------
-def train_one_epoch(model, loader, optimizer, loss_fn, device, scaler):
+def train_one_epoch(model, loader, optimizer, loss_fn, device, scaler, amp_dtype, amp_enabled):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=torch.float16):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             outputs = model(images)
             loss = loss_fn(outputs, labels)
         scaler.scale(loss).backward()
@@ -162,14 +163,15 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, scaler):
 
 
 @torch.no_grad()
-def evaluate(model, loader, loss_fn, device):
+def evaluate(model, loader, loss_fn, device, amp_dtype, amp_enabled):
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
     all_targets, all_preds = [], []
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        loss = loss_fn(outputs, labels)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            outputs = model(images)
+            loss = loss_fn(outputs, labels)
         total_loss += loss.item() * labels.size(0)
         preds = outputs.argmax(1)
         correct += (preds == labels).sum().item()
@@ -182,7 +184,7 @@ def evaluate(model, loader, loss_fn, device):
 def save_confusion_matrix(cm, class_names, out_png, title="Matriz de confusión"):
     fig = plt.figure(figsize=(4, 3))
     ax = fig.add_subplot(111)
-    im = ax.imshow(cm, interpolation='nearest')
+    ax.imshow(cm, interpolation='nearest')
     ax.set_title(title)
     tick_marks = np.arange(len(class_names))
     ax.set_xticks(tick_marks)
@@ -202,8 +204,11 @@ def save_confusion_matrix(cm, class_names, out_png, title="Matriz de confusión"
 
 def compute_class_weights_from_indices(all_samples, indices, num_classes):
     labels = [all_samples[i][1] for i in indices]
-    counts = np.bincount(labels, minlength=num_classes)
-    weights = counts.sum() / (len(counts) * counts + 1e-6)
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
+    # pesos ~ inverso de la frecuencia, normalizados a media=1
+    freq = counts / (counts.sum() + 1e-9)
+    weights = 1.0 / (freq + 1e-9)
+    weights = weights / weights.mean()
     return weights, counts.tolist()
 
 
@@ -244,12 +249,16 @@ def main():
         k_folds=args.k_folds,
         test_split=args.test_split,
         seed=args.seed,
-        final_fit=args.final_fit or True
+        final_fit=args.final_fit   # respeta el flag
     )
 
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ensure_dir(cfg.out_dir)
+
+    amp_enabled = torch.cuda.is_available()
+    amp_dtype   = torch.float16 if amp_enabled else torch.bfloat16
+    pin = torch.cuda.is_available()
 
     # Datasets base y transforms
     train_tfms, val_tfms = build_transforms(cfg.image_size)
@@ -270,10 +279,10 @@ def main():
     y_trainval = [targets[i] for i in trainval_idx]
 
     fold_summaries = []
-    # Prepara DataLoader de TEST (constante)
+    # DataLoader de TEST (constante)
     test_ds = Subset(datasets.ImageFolder(cfg.data_dir, transform=val_tfms), test_idx)
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
-                             num_workers=cfg.num_workers, pin_memory=True)
+                             num_workers=cfg.num_workers, pin_memory=pin)
 
     for fold, (tr_rel, val_rel) in enumerate(skf.split(trainval_idx, y_trainval), start=1):
         print(f"\n===== Fold {fold}/{cfg.k_folds} =====")
@@ -289,19 +298,24 @@ def main():
                                                                    tr_idx, num_classes)
         alpha_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
         print("Conteo por clase (train fold):", counts)
+        print("Pesos alpha:", class_weights)
 
         # Dataloaders
         dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=cfg.num_workers, pin_memory=True)
+                              num_workers=cfg.num_workers, pin_memory=pin)
         dl_val   = DataLoader(ds_val, batch_size=cfg.batch_size, shuffle=False,
-                              num_workers=cfg.num_workers, pin_memory=True)
+                              num_workers=cfg.num_workers, pin_memory=pin)
 
         # Modelo y optimizadores
         model = make_model(cfg.model_name, num_classes, device)
 
-        loss_fn = FocalLoss(alpha=alpha_tensor, gamma=cfg.focal_gamma)
+        # === Loss recomendada (más estable que Focal para tu caso)
+        loss_fn = nn.CrossEntropyLoss(weight=alpha_tensor, label_smoothing=0.05)
+        # Si querés Focal en su lugar:
+        # loss_fn = FocalLoss(alpha=alpha_tensor, gamma=cfg.focal_gamma)
+
         optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=3, verbose=True)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=3)
 
         # Congelar backbone (warm-up de la cabeza)
         def set_backbone_requires_grad(flag: bool):
@@ -312,7 +326,7 @@ def main():
                     p.requires_grad = flag
 
         set_backbone_requires_grad(False)
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
         early = EarlyStopping(patience=cfg.patience, minimize=True)
 
         best_val_loss = float('inf')
@@ -329,8 +343,8 @@ def main():
             if epoch == cfg.freeze_backbone_epochs:
                 set_backbone_requires_grad(True)
 
-            tr_loss, tr_acc = train_one_epoch(model, dl_train, optimizer, loss_fn, device, scaler)
-            va_loss, va_acc, y_true_val, y_pred_val = evaluate(model, dl_val, loss_fn, device)
+            tr_loss, tr_acc = train_one_epoch(model, dl_train, optimizer, loss_fn, device, scaler, amp_dtype, amp_enabled)
+            va_loss, va_acc, y_true_val, y_pred_val = evaluate(model, dl_val, loss_fn, device, amp_dtype, amp_enabled)
             scheduler.step(va_loss)
 
             if va_loss < best_val_loss:
@@ -363,11 +377,14 @@ def main():
                 break
 
         # Cargar mejor modelo del fold
-        ckpt = torch.load(best_path, map_source='cpu') if not torch.cuda.is_available() else torch.load(best_path)
+        if not torch.cuda.is_available():
+            ckpt = torch.load(best_path, map_location='cpu')
+        else:
+            ckpt = torch.load(best_path)
         model.load_state_dict(ckpt["state_dict"])
 
         # Evaluación en VAL (mejor checkpoint)
-        val_loss, val_acc, y_true_val, y_pred_val = evaluate(model, dl_val, loss_fn, device)
+        val_loss, val_acc, y_true_val, y_pred_val = evaluate(model, dl_val, loss_fn, device, amp_dtype, amp_enabled)
         val_report = classification_report(y_true_val, y_pred_val, target_names=class_names, digits=4, zero_division=0)
         cm_val = confusion_matrix(y_true_val, y_pred_val)
         # Guardar artefactos de VAL
@@ -375,8 +392,8 @@ def main():
             f.write(val_report)
         save_confusion_matrix(cm_val, class_names, os.path.join(fold_dir, "val_cm.png"), title="Confusión (VAL)")
 
-        # Evaluación en TEST (referencia)
-        test_loss, test_acc, y_true_test, y_pred_test = evaluate(model, test_loader, loss_fn, device)
+        # Evaluación en TEST (referencia, constante entre folds)
+        test_loss, test_acc, y_true_test, y_pred_test = evaluate(model, test_loader, loss_fn, device, amp_dtype, amp_enabled)
         test_report = classification_report(y_true_test, y_pred_test, target_names=class_names, digits=4, zero_division=0)
         cm_test = confusion_matrix(y_true_test, y_pred_test)
         with open(os.path.join(fold_dir, "test_report.txt"), "w", encoding="utf-8") as f:
@@ -393,10 +410,8 @@ def main():
         }
         # Extra: recall de MI (si existe la clase "MI")
         try:
-            # Buscar índice de MI en class_names
             if "MI" in class_names:
                 mi_idx = class_names.index("MI")
-                # report dict para val
                 rep_val = classification_report(y_true_val, y_pred_val, target_names=class_names, output_dict=True, zero_division=0)
                 rep_test = classification_report(y_true_test, y_pred_test, target_names=class_names, output_dict=True, zero_division=0)
                 fold_summary["val_recall_MI"] = float(rep_val["MI"]["recall"])
@@ -438,18 +453,24 @@ def main():
         # Datasets completos
         ds_trainval = Subset(datasets.ImageFolder(cfg.data_dir, transform=train_tfms), trainval_idx)
         dl_trainval = DataLoader(ds_trainval, batch_size=cfg.batch_size, shuffle=True,
-                                 num_workers=cfg.num_workers, pin_memory=True)
+                                 num_workers=cfg.num_workers, pin_memory=pin)
 
         # Pesos por clase desde TRAIN+VAL completo
         class_weights, counts = compute_class_weights_from_indices(datasets.ImageFolder(cfg.data_dir).samples,
                                                                    trainval_idx, num_classes)
         alpha_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
         print("Conteo por clase (TRAIN+VAL completo):", counts)
+        print("Pesos alpha:", class_weights)
 
         model = make_model(cfg.model_name, num_classes, device)
-        loss_fn = FocalLoss(alpha=alpha_tensor, gamma=cfg.focal_gamma)
+
+        # Loss recomendada para final fit:
+        loss_fn = nn.CrossEntropyLoss(weight=alpha_tensor, label_smoothing=0.05)
+        # (Si preferís Focal:)
+        # loss_fn = FocalLoss(alpha=alpha_tensor, gamma=cfg.focal_gamma)
+
         optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=3, verbose=True)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=3)
 
         def set_backbone_requires_grad(flag: bool):
             for n, p in model.named_parameters():
@@ -459,7 +480,7 @@ def main():
                     p.requires_grad = flag
 
         set_backbone_requires_grad(False)
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
         early = EarlyStopping(patience=cfg.patience, minimize=True)
 
         best_path = os.path.join(cfg.out_dir, f"{cfg.model_name}_FINAL_best.pt")
@@ -468,8 +489,8 @@ def main():
         for epoch in range(cfg.epochs):
             if epoch == cfg.freeze_backbone_epochs:
                 set_backbone_requires_grad(True)
-            tr_loss, tr_acc = train_one_epoch(model, dl_trainval, optimizer, loss_fn, device, scaler)
-            # usar parte de TRAIN+VAL como pseudo-val? aquí usamos TEST solo al final para no sesgar
+            tr_loss, tr_acc = train_one_epoch(model, dl_trainval, optimizer, loss_fn, device, scaler, amp_dtype, amp_enabled)
+            # usar pérdida de train como proxy para scheduler en final (no evaluamos en val aquí)
             scheduler.step(tr_loss)
             print(f"[FINAL] Epoch {epoch+1:03d}/{cfg.epochs} | loss={tr_loss:.4f} acc={tr_acc:.4f}")
             if tr_loss < best_loss:
@@ -484,9 +505,12 @@ def main():
                 break
 
         # Evaluación única en TEST con el mejor modelo final
-        ckpt = torch.load(best_path, map_source='cpu') if not torch.cuda.is_available() else torch.load(best_path)
+        if not torch.cuda.is_available():
+            ckpt = torch.load(best_path, map_location='cpu')
+        else:
+            ckpt = torch.load(best_path)
         model.load_state_dict(ckpt["state_dict"])
-        test_loss, test_acc, y_true_test, y_pred_test = evaluate(model, test_loader, loss_fn, device)
+        test_loss, test_acc, y_true_test, y_pred_test = evaluate(model, test_loader, loss_fn, device, amp_dtype, amp_enabled)
         test_report = classification_report(y_true_test, y_pred_test, target_names=class_names, digits=4, zero_division=0)
         cm_test = confusion_matrix(y_true_test, y_pred_test)
         with open(os.path.join(cfg.out_dir, "FINAL_test_report.txt"), "w", encoding="utf-8") as f:
